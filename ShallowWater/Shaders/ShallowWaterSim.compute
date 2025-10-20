@@ -1,0 +1,491 @@
+#pragma kernel InitWater                
+#pragma kernel Advect                   
+#pragma kernel SolveDivergence          
+#pragma kernel SolvePressure           
+#pragma kernel ApplyBoundary            
+#pragma kernel InjectWater              
+#pragma kernel GaussianBlurHorizontal   
+#pragma kernel GaussianBlurVertical    
+#pragma kernel CalculateFoam        
+
+
+Texture2D<float> H_read;            
+Texture2D<float2> Velocity_read;    
+Texture2D<float> B_read;           
+Texture2D<float> Foam_read;         
+RWTexture2D<float> H_write;         
+RWTexture2D<float2> Velocity_write; 
+RWTexture2D<float> B_write;        
+RWTexture2D<float> Foam_write;      
+int2 size;                          
+float dt;                        
+float dx;                           
+float g;                            
+float2 center;                      
+float slopeHeight;                
+float waveRadius;                
+float maxHeight;                   
+#define dy dx                     
+#define EPS 0.0001
+#define maxAbs(a,b) (abs(a) > abs(b) ? a : b)
+
+// Water source definition
+struct WaterSourceData
+{
+    float2 position;
+    float radius;
+    float injectionRate;
+};
+StructuredBuffer<WaterSourceData> waterSources; // Water source data buffer
+int waterSourceCount;                       // Number of water sources
+
+
+SamplerState my_Linear_Clamp_sampler; // Sampler using linear filtering and edge clamp
+
+// Get 4 neighboring samples and interpolation bounds
+void GetNeighborhood_float2(Texture2D<float2> Tex,float2 uv_coord, out float2 v00, out float2 v10, out float2 v01, out float2 v11, out float2 v_min, out float2 v_max)
+{
+    // Convert UV coordinates to pixel coordinates
+    float2 pixel_coord = uv_coord * (float2)size;
+    
+    // Find lower-left integer pixel coordinates
+    float2 floor_coord = floor(pixel_coord - 0.5);
+    
+    // Fetch pixel values of the 4 neighboring points
+    v00 = Tex[int2(floor_coord.x, floor_coord.y)];
+    v10 = Tex[int2(floor_coord.x + 1, floor_coord.y)];
+    v01 = Tex[int2(floor_coord.x, floor_coord.y + 1)];
+    v11 = Tex[int2(floor_coord.x + 1, floor_coord.y + 1)];
+    
+    // Compute min/max velocity components for fallback checks
+    v_min = min(min(v00, v10), min(v01, v11));
+    v_max = max(max(v00, v10), max(v01, v11));
+}
+
+[numthreads(8,8,1)]
+void InitWater(uint3 id : SV_DispatchThreadID)
+{
+
+    int2 coords = id.xy;
+
+    float2 dist_vec = coords - center;
+    float dist = length(dist_vec);
+    float h = 0;
+    float foam = 0;
+    if (dist < waveRadius)
+    {
+        h += maxHeight * (1.0 - dist / waveRadius);
+        foam += maxHeight * (1.0 - dist / (waveRadius*0.1));
+        //B_write[coords] = 10 * (1.0 - dist / waveRadius);
+    }
+    float b_result = B_read[coords];
+    if(coords.x <= 1)b_result = B_read[coords + int2(1, 0)];
+    if(coords.x >= size.x - 1)b_result = B_read[coords - int2(1, 0)];
+    if(coords.y <= 1)b_result = B_read[coords + int2(0, 1)];
+    if(coords.y >= size.y - 1)b_result = B_read[coords - int2(0, 1)];
+    H_write[coords] = max(b_result, h);
+    Foam_write[coords] = 0;
+
+    // --- Initialize velocity field to zero ---
+    Velocity_write[coords] = float2(0.0, 0.0);
+}
+
+[numthreads(8,8,1)]
+void Advect(uint3 id : SV_DispatchThreadID)
+{
+    int2 coords = id.xy;
+    
+    // Boundary handling
+    if (coords.x <= 1 || coords.y <= 1 || coords.x >= size.x - 1 || coords.y >= size.y - 1)
+    {
+        Velocity_write[coords] = Velocity_read[coords];
+        H_write[coords] = H_read[coords];
+        return;
+    }
+
+    float2 cell_size = float2(dx, dy);
+    float2 arrival_pos = (float2)coords + 0.5f;
+    float2 uv_pos = arrival_pos / (float2)size;
+
+    // 1. First semi-Lagrangian backtrace (predictor step)
+    // This produces a source point and a basic advection result (fallback).
+    float2 vel_vel = Velocity_read[coords];
+
+    // Compute particle position from previous time step (source point)
+    float2 pos_vel_pre = uv_pos - vel_vel * dt / (float2)size;
+    float2 pos_vel_Fast = uv_pos - vel_vel * dt * 1 / (float2)size;
+
+    // Get interpolation neighborhood and velocity bounds ---
+    float2 v00, v10, v01, v11, vel_min, vel_max;
+    GetNeighborhood_float2(Velocity_read,pos_vel_pre, v00, v10, v01, v11, vel_min, vel_max);
+
+    // 1. Semi-Lagrangian result
+    float2 vel_sl = Velocity_read.SampleLevel(my_Linear_Clamp_sampler, pos_vel_pre, 0);
+    // 2. Corrected MacCormack result
+    // a. Predictor: use the semi-Lagrangian result (vel_sl_result)
+    // b. Corrector:
+    //    Step forward from the source using predicted velocity to get an intermediate position
+    float2 uv_mid = pos_vel_pre + vel_sl * dt / (float2)size;
+    float2 error = uv_pos - uv_mid;
+    //    Add half the error back to predictor for corrected velocity
+    float2 vel_mac = vel_sl + 0.5 * error * (float2)size / dt;
+    // Perform fallback check and final assignment ---
+    // Check whether MacCormack result exceeds interpolation neighborhood bounds
+    bool is_in_bounds = all(vel_mac >= vel_min) && all(vel_mac <= vel_max);
+    float2 final_velocity = is_in_bounds ? vel_mac : vel_sl;
+
+    //Foam
+    float foam_result = Foam_read.SampleLevel(my_Linear_Clamp_sampler, pos_vel_Fast, 0);
+
+
+    Velocity_write[coords] = final_velocity;     
+    H_write[coords] = H_read[coords];
+    Foam_write[coords] = foam_result;
+    //Velocity_write[coords] = Velocity_read[coords];  
+       
+}
+
+[numthreads(8,8,1)]
+void SolveDivergence(uint3 id : SV_DispatchThreadID)
+{
+    int2 coords = id.xy;
+    // Ignore one-pixel border
+    if(coords.x <= 1 || coords.y <= 1 || coords.x >= size.x - 1 || coords.y >= size.y - 1)
+    {
+        H_write[coords] = H_read[coords];
+        return;
+    }
+
+    float h_center = H_read[coords] - B_read[coords];
+    float h_right = H_read[coords + int2(1, 0)] - B_read[coords + int2(1, 0)];
+    float h_left = H_read[coords - int2(1, 0)] - B_read[coords - int2(1, 0)];
+    float h_top = H_read[coords + int2(0, 1)] - B_read[coords + int2(0, 1)];
+    float h_down = H_read[coords - int2(0, 1)] - B_read[coords - int2(0, 1)];
+
+    // Grid finite difference
+    float fxR = Velocity_read[coords].x;
+    float fxL = Velocity_read[coords - int2(1, 0)].x;    	
+    float fyT = Velocity_read[coords].y; 
+    float fyB = Velocity_read[coords - int2(0, 1)].y;
+
+    float hR = (fxR <= 0) ? h_right : h_center;
+    float hL = (fxL >  0) ? h_left  : h_center;    
+    float hT = (fyT <= 0) ? h_top   : h_center;
+    float hB = (fyB >  0) ? h_down  : h_center;
+
+    float beta = 2.0;
+    float hAvgMax = beta * dx / ( g * (dt) );
+    float hAdj = max( 0.0, (hL+hR+hT+hB)/4.0 - hAvgMax );
+
+    hR -= hAdj;
+    hL -= hAdj;    
+    hT -= hAdj;
+    hB -= hAdj;
+
+    float dH = (hR * fxR - hL * fxL) / dx + (hT * fyT - hB * fyB) / dy;
+    float newH = max(0.0, h_center - dH * dt);
+
+    float edgeLimit = dx * 2;
+    float a_edge = 0.25;  
+    H_write[coords] = newH + B_read[coords];
+
+    float eta_center = H_read[coords];
+    float eta_right = H_read[coords + int2(1, 0)];
+    float eta_left = H_read[coords - int2(1, 0)];
+    float eta_top = H_read[coords + int2(0, 1)];
+    float eta_bottom = H_read[coords - int2(0, 1)];
+    float x = maxAbs(eta_right - eta_center, eta_center - eta_left)/dx;
+    float y = maxAbs(eta_top - eta_center, eta_center - eta_bottom)/dy;
+
+    float aminSplash = 0.5;
+    float vminSplash = 0.1;
+    float lminSplash = -0.6;
+    float foam_result = Foam_read[coords];
+    bool isSplash0 = sqrt(x*x + y*y) > aminSplash * g * dt/dx;
+    bool isSplash1 = (newH + B_read[coords])- H_read[coords] > vminSplash * dt;
+    bool isSplash2 = (eta_right + eta_left + eta_top + eta_bottom - 4*eta_center)/dt*dt < lminSplash;
+
+    if(isSplash0 || isSplash1 || isSplash2)
+    {
+        foam_result += 0.1;        
+    }
+    
+
+
+    float b_center = B_read[coords];
+    float b_right = B_read[coords + int2(1, 0)];
+    float b_left = B_read[coords - int2(1, 0)];
+    float b_top = B_read[coords + int2(0, 1)];
+    float b_bottom = B_read[coords - int2(0, 1)];
+    Foam_write[coords] = foam_result * 0.996;
+}
+
+[numthreads(8,8,1)]
+void SolvePressure(uint3 id : SV_DispatchThreadID)
+{
+    int2 coords = id.xy;
+    // Ignore boundary
+    if(coords.x <= 1 || coords.y <= 1 || coords.x >= size.x - 1 || coords.y >= size.y - 1)
+    {
+        Velocity_write[coords] = Velocity_read[coords];
+        return;
+    }
+
+    float2 vel_center = Velocity_read[coords];
+    
+    float b_center = B_read[coords];
+    float b_right = B_read[coords + int2(1, 0)];
+    float b_top = B_read[coords + int2(0, 1)];
+
+    float eta_center = H_read[coords];
+    float eta_right = H_read[coords + int2(1, 0)];
+    float eta_top = H_read[coords + int2(0, 1)];
+
+    float h_center = eta_center - b_center;
+    float h_right = eta_right - b_right;
+    float h_top = eta_top - b_top;
+
+    float grad_eta_x = (eta_right - eta_center) / dx * g;
+    float grad_eta_y = (eta_top - eta_center) / dy * g;
+
+    float2 new_velocity = vel_center - float2(grad_eta_x, grad_eta_y) * dt;
+    float l = length(new_velocity);
+    if(l > 0)
+    {
+        float alpha = 0.5;
+		new_velocity /= l;
+		l = min( l, dx / (dt) * alpha );
+		new_velocity *= l;
+    }
+    if((h_center <= EPS) && (b_center > eta_right) || (h_right <= EPS) && (b_right > eta_center))
+    {
+        new_velocity.x = 0;
+    }
+    if((h_center <= EPS) && (b_center > eta_top) || (h_top <= EPS) && (b_top > eta_center))
+    {
+        new_velocity.y = 0;
+    }
+
+    Velocity_write[coords] = new_velocity;
+}
+
+[numthreads(8,8,1)]
+void ApplyBoundary(uint3 id : SV_DispatchThreadID)
+{
+    int2 coords = id.xy;
+    if (coords.x >= size.x|| coords.y >= size.y) return;
+
+    float h = H_read[coords];
+    float2 uv = Velocity_read[coords];
+
+    if (coords.x <= 1) 
+    {
+        uv.x = 0;
+        h = H_read[coords + int2(1, 0)];          
+    }
+    if (coords.x >= size.x - 1) {
+        uv.x = 0;
+        h = H_read[coords - int2(1, 0)];
+    }
+    if (coords.y <= 1) {
+        uv.y = 0;
+        h = H_read[coords + int2(0, 1)];
+    }
+    if (coords.y >= size.y - 1) 
+    {
+        uv.y = 0;
+        h = H_read[coords - int2(0, 1)];
+    }
+
+    H_write[coords] = h;
+    Velocity_write[coords] = uv;
+}
+
+
+[numthreads(8,8,1)]
+void CalculateFoam(uint3 id : SV_DispatchThreadID)
+{
+    int2 coords = id.xy;
+    if (coords.x >= size.x - 1 || coords.y >= size.y - 1) return;
+
+    float eta_center = H_read[coords];
+    float eta_right = H_read[coords + int2(1, 0)];
+    float eta_left = H_read[coords - int2(1, 0)];
+    float eta_top = H_read[coords + int2(0, 1)];
+    float eta_bottom = H_read[coords - int2(0, 1)];
+    float x = maxAbs(eta_right - eta_center, eta_center - eta_left)/dx;
+    float y = maxAbs(eta_top - eta_center, eta_center - eta_bottom)/dy;
+
+    float aminSplash = 0.45;
+    float foam_result = Foam_read[coords];
+
+    if(sqrt(x*x + y*y) > aminSplash * g * dt/dx)
+    {
+        foam_result += 1;
+    }
+
+    float b_center = B_read[coords];
+    float b_right = B_read[coords + int2(1, 0)];
+    float b_left = B_read[coords - int2(1, 0)];
+    float b_top = B_read[coords + int2(0, 1)];
+    float b_bottom = B_read[coords - int2(0, 1)];
+    Foam_write[coords] = foam_result * 0.9;
+}
+
+[numthreads(8,8,1)]
+void InjectWater(uint3 id : SV_DispatchThreadID)
+{
+    int2 coords = id.xy;
+    if (coords.x >= size.x - 1 || coords.y >= size.y - 1) return;
+
+    float currentH = 0; // Read from previous step output
+
+    for (int s = 0; s < waterSourceCount; s++)
+    {
+        float distSq = pow(coords.x - waterSources[s].position.x, 2) + pow(coords.y - waterSources[s].position.y, 2);
+        float radiusSq = waterSources[s].radius * waterSources[s].radius;
+        if (distSq < radiusSq)
+        {
+            float falloff = 1.0 - sqrt(distSq) / waterSources[s].radius;
+            currentH += waterSources[s].injectionRate * dt * falloff;
+        }
+    }
+    
+    H_write[coords] += currentH;
+}
+
+// Gaussian blur - horizontal pass (group shared memory optimized)
+
+#define KERNEL_RADIUS 1 // Gaussian kernel radius (for a 5x5 kernel, radius is 2)
+#define KERNEL_SIZE (KERNEL_RADIUS * 2 + 1) // Full kernel size = 5
+#define GROUP_SIZE_X 8 // Thread group size in X, must match numthreads below
+#define GROUP_SIZE_Y 8 // Thread group size in Y
+
+// Required tile width = group width + extra pixels on both sides
+// Example: leftmost thread (x=0) reads 2 pixels left, rightmost (x=7) reads 2 pixels right.
+// Total width needed: 2(left) + 8(center) + 2(right) = 12 pixels.
+#define SHARED_DATA_WIDTH (GROUP_SIZE_X + KERNEL_RADIUS * 2)
+
+// Define shared memory array
+// Each 8x8 group has its own 8x12 shared memory tile
+groupshared float shared_H_Horizontal[GROUP_SIZE_Y][SHARED_DATA_WIDTH];
+//static const float weights[5] = {0.05,0.1, 0.7, 0.1,0.05};
+static const float weights[3] = {0.1, 0.8, 0.1};
+//static const float weights[5] = {0,0, 1, 0,0};
+[numthreads(GROUP_SIZE_X, GROUP_SIZE_Y, 1)]
+void GaussianBlurHorizontal(uint3 dispatchThreadID : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    // --- 1. Load data into shared memory ---
+    
+    // Compute local thread coordinates within the group (0-7, 0-7)
+    int2 localCoords = groupThreadID.xy;
+    // Compute global pixel coordinates handled by this thread
+    int2 globalCoords = dispatchThreadID.xy;
+
+    // Compute global top-left coordinate of this group tile
+    int startX = groupID.x * GROUP_SIZE_X - KERNEL_RADIUS;
+    int startY = groupID.y * GROUP_SIZE_Y;
+    
+    // Each thread loads one pixel from global memory into shared memory
+    // We need to load a 12x8 tile, but there are only 8x8=64 threads.
+    // So some threads load twice to fill the shared tile.
+    int loadX1 = startX + localCoords.x;
+    int loadX2 = startX + localCoords.x + GROUP_SIZE_X;
+    int loadY = startY + localCoords.y;
+
+    // Load first part (first 8 columns)
+    if (loadX1 >= 0 && loadX1 < size.x && loadY < size.y) {
+        shared_H_Horizontal[localCoords.y][localCoords.x] = H_read[int2(loadX1, loadY)];
+    } else {
+        shared_H_Horizontal[localCoords.y][localCoords.x] = 0.0; // Fill out-of-bounds area with 0
+    }
+
+    // Load second part (last 4 columns, handled by the first 4 columns of threads)
+    if (localCoords.x < KERNEL_RADIUS * 2) {
+        if (loadX2 >= 0 && loadX2 < size.x && loadY < size.y) {
+            shared_H_Horizontal[localCoords.y][localCoords.x + GROUP_SIZE_X] = H_read[int2(loadX2, loadY)];
+        } else {
+            shared_H_Horizontal[localCoords.y][localCoords.x + GROUP_SIZE_X] = 0.0; // Fill out-of-bounds area with 0
+        }
+    }
+    
+    // --- 2. Synchronize threads ---
+    GroupMemoryBarrierWithGroupSync();
+
+    // --- 3. Read from shared memory and compute ---
+    
+    // Check whether the thread pixel is inside image bounds
+    if (globalCoords.x < size.x && globalCoords.y < size.y)
+    {
+        float result = 0.0;
+                
+        float weightSum = 0.0;
+        [unroll]
+        for (int i = 0; i < KERNEL_SIZE; i++)
+        {
+            int offset = i - KERNEL_RADIUS; // Offset: -2, -1, 0, 1, 2
+            result += shared_H_Horizontal[localCoords.y][localCoords.x + KERNEL_RADIUS + offset] * weights[i];
+        }
+        
+        H_write[globalCoords] = result;
+        //H_write[globalCoords] = H_read[globalCoords];
+    }
+}
+
+#define SHARED_DATA_HEIGHT (GROUP_SIZE_Y + KERNEL_RADIUS * 2)
+
+// Define shared memory array
+// Shape becomes 12x8 (height x width)
+groupshared float shared_H_Vertical[SHARED_DATA_HEIGHT][GROUP_SIZE_X];
+
+[numthreads(GROUP_SIZE_X, GROUP_SIZE_Y, 1)]
+void GaussianBlurVertical(uint3 dispatchThreadID : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID, uint3 groupID : SV_GroupID)
+{
+    // --- 1. Load data into shared memory ---
+    
+    int2 localCoords = groupThreadID.xy;
+    int2 globalCoords = dispatchThreadID.xy;
+
+    // Compute global top-left coordinate of this group tile
+    int startX = groupID.x * GROUP_SIZE_X;
+    int startY = groupID.y * GROUP_SIZE_Y - KERNEL_RADIUS;
+    
+    // Each thread loads one pixel from global memory into shared memory
+    // This time, threads with Y in 0-3 load extra bottom data
+    int loadX = startX + localCoords.x;
+    int loadY1 = startY + localCoords.y;
+    int loadY2 = startY + localCoords.y + GROUP_SIZE_Y;
+
+    // Load first part (first 8 rows)
+    if (loadX < size.x && loadY1 >= 0 && loadY1 < size.y) {
+        shared_H_Vertical[localCoords.y][localCoords.x] = H_write[int2(loadX, loadY1)];
+    } else {
+        shared_H_Vertical[localCoords.y][localCoords.x] = 0.0;
+    }
+
+    // Load second part (last 4 rows, handled by the first 4 rows of threads)
+    if (localCoords.y < KERNEL_RADIUS * 2) {
+        if (loadX < size.x && loadY2 >= 0 && loadY2 < size.y) {
+            shared_H_Vertical[localCoords.y + GROUP_SIZE_Y][localCoords.x] = H_write[int2(loadX, loadY2)];
+        } else {
+            shared_H_Vertical[localCoords.y + GROUP_SIZE_Y][localCoords.x] = 0.0;
+        }
+    }
+    
+    // --- 2. Synchronize threads ---
+    GroupMemoryBarrierWithGroupSync();
+
+    // --- 3. Read from shared memory and compute ---
+    if (globalCoords.x < size.x && globalCoords.y < size.y)
+    {
+        float result = 0.0;    
+        [unroll]
+        for (int i = 0; i < KERNEL_SIZE; i++)
+        {
+            int offset = i - KERNEL_RADIUS;
+            result += shared_H_Vertical[localCoords.y + KERNEL_RADIUS + offset][localCoords.x] * weights[i];
+        }
+        
+        H_write[globalCoords] = result;
+    }
+}
