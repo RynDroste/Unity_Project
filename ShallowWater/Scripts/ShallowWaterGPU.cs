@@ -96,6 +96,7 @@ namespace WaterSimulation
             computeShader.SetFloat("dt", dt);
             computeShader.SetFloat("dx", dx);
             computeShader.SetFloat("g", g);
+            Time.fixedDeltaTime = dt;
         }
 
         void CreateRenderTextureInner(ref RenderTexture rt, RenderTextureFormat format)
@@ -148,23 +149,23 @@ namespace WaterSimulation
             pong = temp;
         }
 
-        void Update()
+        void FixedUpdate()
         {
             if (WorldPositionRT == null) return;
             UpdateWaterSources();
 
             int threadGroupsX = (SimulationSize + 7) / 8;
             int threadGroupsY = (SimulationSize + 7) / 8;
-            
+
             for (int i = 0; i < loopCount; i++)
             {
                 computeShader.SetTexture(advectKernel, "H_read", H_ping);
                 computeShader.SetTexture(advectKernel, "Velocity_read", Velocity_ping);
                 computeShader.SetTexture(advectKernel, "B_read", WorldPositionRT);
-                computeShader.SetTexture(advectKernel, "Foam_read", Foam_ping);                
+                computeShader.SetTexture(advectKernel, "Foam_read", Foam_ping);
                 computeShader.SetTexture(advectKernel, "Velocity_write", Velocity_pong);
-                computeShader.SetTexture(advectKernel, "H_write", H_pong);             
-                computeShader.SetTexture(advectKernel, "Foam_write", Foam_pong);   
+                computeShader.SetTexture(advectKernel, "H_write", H_pong);
+                computeShader.SetTexture(advectKernel, "Foam_write", Foam_pong);
                 computeShader.Dispatch(advectKernel, threadGroupsX, threadGroupsY, 1);
                 Swap(ref Velocity_ping, ref Velocity_pong);
                 Swap(ref H_ping, ref H_pong);
@@ -177,7 +178,6 @@ namespace WaterSimulation
                 computeShader.Dispatch(pressureKernel, threadGroupsX, threadGroupsY, 1);
                 Swap(ref Velocity_ping, ref Velocity_pong);
 
-                
                 computeShader.SetTexture(divergenceKernel, "H_read", H_ping);
                 computeShader.SetTexture(divergenceKernel, "Velocity_read", Velocity_ping);
                 computeShader.SetTexture(divergenceKernel, "B_read", WorldPositionRT);
@@ -187,7 +187,6 @@ namespace WaterSimulation
                 computeShader.Dispatch(divergenceKernel, threadGroupsX, threadGroupsY, 1);
                 Swap(ref H_ping, ref H_pong);
                 Swap(ref Foam_ping, ref Foam_pong);
-                
 
                 //Boundary Conditions
                 computeShader.SetTexture(boundaryKernel, "H_read", H_ping);
@@ -215,25 +214,32 @@ namespace WaterSimulation
                 computeShader.SetTexture(injectKernel, "H_write", H_ping);
                 computeShader.Dispatch(injectKernel, threadGroupsX, threadGroupsY, 1);
             }
+        }
 
-            // Horizontal blur pass: terrain -> terrainTemp
+        void Update()
+        {
+            if (WorldPositionRT == null) return;
+
+            int threadGroupsX = (SimulationSize + 7) / 8;
+            int threadGroupsY = (SimulationSize + 7) / 8;
+
+            // Horizontal blur pass
             computeShader.SetTexture(blurHorizontalKernel, "H_read", H_ping);
-            computeShader.SetTexture(blurHorizontalKernel, "H_write", H_Result);            
+            computeShader.SetTexture(blurHorizontalKernel, "H_write", H_Result);
             computeShader.SetInts("size", SimulationSize, SimulationSize);
             computeShader.Dispatch(blurHorizontalKernel, threadGroupsX, threadGroupsY, 1);
-            
-            // Vertical blur pass: terrainTemp -> terrain
-            computeShader.SetTexture(blurVerticalKernel, "H_read", H_Result);            
+
+            // Vertical blur pass
+            computeShader.SetTexture(blurVerticalKernel, "H_read", H_Result);
             computeShader.SetTexture(blurVerticalKernel, "H_write", H_Result);
             computeShader.SetInts("size", SimulationSize, SimulationSize);
             computeShader.Dispatch(blurVerticalKernel, threadGroupsX, threadGroupsY, 1);
-
 
             waterMaterial.SetTexture("_H_Blur", H_Result);
             waterMaterial.SetTexture("_H", H_ping);
             waterMaterial.SetTexture("_B", WorldPositionRT);
             waterMaterial.SetTexture("_Foam", Foam_ping);
-            waterMaterial.SetTexture("_Velocity", Velocity_ping);    
+            waterMaterial.SetTexture("_Velocity", Velocity_ping);
             Shader.SetGlobalInt("_SimulationPixelSize", SimulationSize);
             Shader.SetGlobalInt("_SceneDepthRTSize", SceneDepthRTSize);
         }
